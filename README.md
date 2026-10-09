@@ -12,6 +12,7 @@ Open the dashboard, see what your PC is doing, and launch WinUtil when you want 
 - **Shows live readings.** CPU and physical RAM usage, disk activity and transfer rates, network traffic, drive capacity, and supported NVIDIA GPU readings.
 - **Makes comparisons easy.** Capture ten-second averages before and after a change, add a workload note, and export the results as JSON or CSV.
 - **Supports WinUtil automation.** Select an original preset or supply a configuration file or URL when you already know which changes you want.
+- **Keeps errors visible.** A session log appears below the error count in full WinUtil, and the dashboard has a persistent operation status bar and log viewer.
 
 The dashboard is portable and uses Windows' built-in .NET Framework and Windows PowerShell. There is no installer or additional monitoring service.
 
@@ -21,7 +22,17 @@ Download **WinUtil-Performance.exe** from the [latest release](https://github.co
 
 Release builds are unsigned. This is an independent companion project, not an official Chris Titus Tech application.
 
+See the [changelog](CHANGELOG.md) for version history and bug fixes.
+
 To use individual WinUtil options, select **Open full WinUtil**. For automation, choose a preset or configuration and select **Apply chosen profile**. Automation runs the selected WinUtil operations immediately; presets can contain broader system changes than their names suggest. The **Offline** checkbox passes WinUtil's original flag and does not prevent network access.
+
+**Gaming — enable Game Mode** is a companion preset that enables Windows Game Mode only. Standard, Minimal, and Advanced retain their upstream selections. Gaming does not combine with an additional configuration file, so its scope stays clear.
+
+## Status and error logs
+
+The dashboard's status bar shows the current WinUtil operation, progress, and error count. Sensor updates have a separate status line, so they do not erase an operation's message. Select **Show log** to read the current session's details.
+
+Full WinUtil has a scrollable session log directly below its error count. Logs stay on your PC and remain available after an operation finishes. Startup failures are also recorded, including failures that happen before the full window opens.
 
 ## Measure before and after
 
@@ -47,7 +58,7 @@ Each capture averages ten seconds of observed activity. These readings are usefu
 
 CPU, memory, disk, and network readings update about once per second. GPU readings and drive capacity refresh about every five seconds. The graph retains the latest 120 samples. A dash means that a reading is unavailable or still warming up. Network totals can include virtual adapters, so they may differ from the traffic reported by a router or internet provider.
 
-Monitoring stays local. Captures are saved in your Windows user profile, and JSON and CSV exports are written only where you choose to save them. Exports can include drive labels, adapter descriptions, and your workload note. New installations start without someone else's performance results. The original WinUtil tools may use the internet for their own operations.
+Monitoring and session logs stay local. Captures are saved in your Windows user profile, and JSON and CSV exports are written only where you choose to save them. Exports and logs can include file paths, drive labels, adapter descriptions, software details, and your workload note. New installations start without someone else's performance results. The original WinUtil tools may use the internet for their own operations.
 
 ## Requirements and build
 
@@ -76,7 +87,7 @@ Use `--help` for all command-line options. `-Config`, `-Preset`, and `-Offline` 
 
 ## Credits and license
 
-WinUtil was created by **Chris Titus Tech and the WinUtil contributors**. This application embeds the unmodified official [WinUtil 26.10.07 release](https://github.com/ChrisTitusTech/winutil/releases/tag/26.10.07), checks its SHA-256, and launches it through Windows PowerShell. The dashboard and monitoring code are separate companion code.
+WinUtil was created by **Chris Titus Tech and the WinUtil contributors**. This application embeds the unmodified official [WinUtil 26.10.07 release](https://github.com/ChrisTitusTech/winutil/releases/tag/26.10.07), checks its SHA-256, and launches it through Windows PowerShell. Companion code adds session logging to the full window at launch; the bundled upstream file remains unchanged. The dashboard, monitoring, and logging additions are this project's code.
 
 Read the [WinUtil documentation](https://winutil.christitus.com/) for the behavior of its system tools. Please send dashboard or monitoring issues to this repository; upstream WinUtil has its own [issue tracker](https://github.com/ChrisTitusTech/winutil/issues).
 

@@ -32,6 +32,17 @@ internal sealed class Dashboard : Form
     private readonly RoundedButton[] navigation = new RoundedButton[3];
     private readonly Label title = new Label();
     private readonly Label status = new Label();
+    private readonly Label sensorStatus = new Label();
+    private readonly Label errorsStatus = new Label();
+    private readonly Label profileSummary = new Label();
+    private readonly RoundedButton openLog = new RoundedButton();
+    private readonly ThinProgress operationProgress = new ThinProgress();
+    private VendorSession vendorSession;
+    private bool sessionPolling;
+    private bool operationActive;
+    private int operationErrors;
+    private string operationStage = "Ready";
+    private RunLogWindow logWindow;
     private readonly RoundedButton fullWinUtil = new RoundedButton();
     private readonly MetricTile overviewCpu, overviewRam, overviewGpu;
     private readonly MetricTile liveCpu, liveRam, liveGpu, liveDisk, liveNetwork, liveGpuPower;
@@ -69,7 +80,7 @@ internal sealed class Dashboard : Form
             if (iconStream != null) Icon = new Icon(iconStream);
         AutoScaleDimensions = new SizeF(96, 96);
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(1180, 740);
+        ClientSize = new Size(1180, 780);
         MinimumSize = new Size(1050, 680);
         StartPosition = FormStartPosition.CenterScreen;
 
@@ -77,7 +88,7 @@ internal sealed class Dashboard : Form
         frame.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 204));
         frame.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         Controls.Add(frame);
-        Panel side = new Panel { Dock = DockStyle.Fill, BackColor = Sidebar, Padding = new Padding(20, 26, 18, 18) };
+        Panel side = new Panel { Dock = DockStyle.Fill, BackColor = Sidebar, Padding = new Padding(20, 26, 18, 18), Margin = new Padding(0) };
         frame.Controls.Add(side, 0, 0);
         TableLayoutPanel sideLayout = Table(1, 6);
         sideLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
@@ -104,12 +115,12 @@ internal sealed class Dashboard : Form
         footer.Dock = DockStyle.Fill;
         sideLayout.Controls.Add(footer, 0, 5);
 
-        Panel main = new Panel { Dock = DockStyle.Fill, Padding = new Padding(24, 18, 24, 10) };
+        Panel main = new Panel { Dock = DockStyle.Fill, Padding = new Padding(24, 18, 24, 10), Margin = new Padding(0) };
         frame.Controls.Add(main, 1, 0);
         TableLayoutPanel mainLayout = Table(1, 3);
         mainLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
         mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        mainLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        mainLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 74));
         main.Controls.Add(mainLayout);
         TableLayoutPanel header = Table(2, 1);
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -130,13 +141,9 @@ internal sealed class Dashboard : Form
         header.Controls.Add(fullWinUtil, 1, 0);
         mainLayout.Controls.Add(header, 0, 0);
         pageHost.Dock = DockStyle.Fill;
+        pageHost.Margin = new Padding(0);
         mainLayout.Controls.Add(pageHost, 0, 1);
-        status.Text = "Ready  ·  Metrics update every second; GPU and drive capacity every five seconds.";
-        status.ForeColor = Muted;
-        status.Font = new Font("Segoe UI", 8.5F);
-        status.Dock = DockStyle.Fill;
-        status.TextAlign = ContentAlignment.MiddleLeft;
-        mainLayout.Controls.Add(status, 0, 2);
+        mainLayout.Controls.Add(BuildStatusBar(), 0, 2);
 
         overviewCpu = new MetricTile("CPU ACTIVITY", Cyan);
         overviewRam = new MetricTile("MEMORY IN USE", Violet);
@@ -155,18 +162,66 @@ internal sealed class Dashboard : Form
         if (!previewMode) LoadSavedCaptures();
 
         timer = new System.Windows.Forms.Timer { Interval = 1000 };
-        timer.Tick += delegate { RequestSample(); };
+        timer.Tick += delegate { PollVendorSession(); RequestSample(); operationProgress.AdvanceAnimation(); if (logWindow != null && !logWindow.IsDisposed) logWindow.RefreshLog(); };
         if (!previewMode)
         {
             Shown += delegate { RequestSample(); timer.Start(); };
         }
-        FormClosed += delegate { timer.Stop(); timer.Dispose(); telemetry.Dispose(); };
+        FormClosed += delegate { timer.Stop(); timer.Dispose(); telemetry.Dispose(); if (vendorSession != null) vendorSession.Dispose(); };
+    }
+
+    private Control BuildStatusBar()
+    {
+        RoundedCard bar = new RoundedCard { Padding = new Padding(13, 8, 13, 7), Margin = new Padding(0, 10, 0, 0) };
+        TableLayoutPanel layout = Table(3, 3);
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 108));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 27));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 5));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        status.Text = "Ready  ·  Choose a profile or open full WinUtil.";
+        status.ForeColor = Foreground; status.Font = new Font("Segoe UI", 9, FontStyle.Bold);
+        status.Dock = DockStyle.Fill; status.TextAlign = ContentAlignment.MiddleLeft; status.AutoEllipsis = true; status.UseMnemonic = false;
+        layout.Controls.Add(status, 0, 0);
+        errorsStatus.Text = "Errors: 0"; errorsStatus.ForeColor = Muted; errorsStatus.Font = new Font("Segoe UI", 9, FontStyle.Bold);
+        errorsStatus.Dock = DockStyle.Fill; errorsStatus.TextAlign = ContentAlignment.MiddleCenter;
+        layout.Controls.Add(errorsStatus, 1, 0);
+        openLog.Text = "Show log"; openLog.BackColor = Sidebar; openLog.ForeColor = Cyan;
+        openLog.Font = new Font("Segoe UI", 9, FontStyle.Bold); openLog.Dock = DockStyle.Fill; openLog.Margin = new Padding(3, 0, 0, 1); openLog.Enabled = false;
+        openLog.Click += delegate { ShowRunLog(); };
+        layout.Controls.Add(openLog, 2, 0);
+        operationProgress.Dock = DockStyle.Fill; operationProgress.Margin = new Padding(0, 2, 0, 1);
+        layout.Controls.Add(operationProgress, 0, 1); layout.SetColumnSpan(operationProgress, 3);
+        sensorStatus.Text = "Sensors: waiting for readings  ·  Read-only monitoring";
+        sensorStatus.ForeColor = Muted; sensorStatus.Font = new Font("Segoe UI", 8); sensorStatus.Dock = DockStyle.Fill;
+        sensorStatus.TextAlign = ContentAlignment.MiddleLeft; sensorStatus.AutoEllipsis = true;
+        layout.Controls.Add(sensorStatus, 0, 2); layout.SetColumnSpan(sensorStatus, 3);
+        bar.Controls.Add(layout);
+        return bar;
+    }
+
+    private void SetOperationStatus(string stage, string message, bool active, int errorCount)
+    {
+        operationStage = stage; operationActive = active; operationErrors = Math.Max(0, errorCount);
+        status.Text = stage + "  ·  " + message;
+        errorsStatus.Text = "Errors: " + operationErrors.ToString(CultureInfo.InvariantCulture);
+        errorsStatus.ForeColor = operationErrors > 0 ? Color.FromArgb(255, 159, 150) : Muted;
+        operationProgress.IsIndeterminate = active;
+        operationProgress.Value = active ? 0 : (stage == "Ready" || stage == "Canceled" ? 0 : 100);
+    }
+
+    private void SetActivityStatus(string message)
+    {
+        // A capture or export must never replace a running WinUtil operation.
+        if (!operationActive) SetOperationStatus("Ready", message, false, operationErrors);
     }
 
     private Panel BuildOverview()
     {
-        Panel page = new Panel();
+        Panel page = new Panel { AutoScroll = true };
         TableLayoutPanel layout = Table(1, 3);
+        MakeScrollable(page, layout, 601);
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 93));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 128));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -198,20 +253,21 @@ internal sealed class Dashboard : Form
     private RoundedCard BuildAutomation()
     {
         RoundedCard card = new RoundedCard { Margin = new Padding(0, 0, 7, 0) };
-        TableLayoutPanel layout = Table(1, 8);
+        TableLayoutPanel layout = Table(1, 9);
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 29));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 39));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 25));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 63));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 43));
         layout.Controls.Add(LabelText("Run a chosen profile", 15, Foreground, FontStyle.Bold), 0, 0);
-        layout.Controls.Add(LabelText("Optional automation applies your selections immediately after you click the button below.", 9.5F, Muted), 0, 1);
-        layout.Controls.Add(LabelText("VENDOR PRESET", 8.5F, Muted, FontStyle.Bold), 0, 2);
+        layout.Controls.Add(LabelText("Applies the selected profile after administrator approval.", 9.5F, Muted), 0, 1);
+        layout.Controls.Add(LabelText("PRESET", 8.5F, Muted, FontStyle.Bold), 0, 2);
         preset.DropDownStyle = ComboBoxStyle.DropDownList;
-        preset.Items.AddRange(new object[] { "None — use full WinUtil to choose", "Standard", "Minimal", "Advanced" });
+        preset.Items.AddRange(new object[] { "None — choose in full WinUtil", "Gaming — Windows Game Mode", "Standard", "Minimal", "Advanced" });
         preset.SelectedIndex = 0;
         preset.Font = new Font("Segoe UI", 10);
         preset.DrawMode = DrawMode.OwnerDrawFixed;
@@ -228,7 +284,10 @@ internal sealed class Dashboard : Form
         preset.Dock = DockStyle.Fill;
         preset.Margin = new Padding(0, 1, 0, 7);
         layout.Controls.Add(preset, 0, 3);
-        layout.Controls.Add(LabelText("CONFIG FILE OR URL  ·  OPTIONAL", 8.5F, Muted, FontStyle.Bold), 0, 4);
+        profileSummary.ForeColor = Muted; profileSummary.Font = new Font("Segoe UI", 9); profileSummary.Dock = DockStyle.Fill;
+        profileSummary.TextAlign = ContentAlignment.MiddleLeft; profileSummary.Margin = new Padding(0, 1, 0, 5);
+        layout.Controls.Add(profileSummary, 0, 4);
+        layout.Controls.Add(LabelText("CONFIG FILE OR URL  ·  OPTIONAL", 8.5F, Muted, FontStyle.Bold), 0, 5);
         TableLayoutPanel configRow = Table(2, 1);
         configRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         configRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
@@ -243,7 +302,7 @@ internal sealed class Dashboard : Form
                 if (dialog.ShowDialog(this) == DialogResult.OK) config.Text = dialog.FileName;
         };
         configRow.Controls.Add(browse, 1, 0);
-        layout.Controls.Add(configRow, 0, 5);
+        layout.Controls.Add(configRow, 0, 6);
         offline.Text = "Offline flag   ·   not a network sandbox";
         offline.ForeColor = Muted;
         offline.Font = new Font("Segoe UI", 9);
@@ -251,17 +310,39 @@ internal sealed class Dashboard : Form
         offline.AutoSize = false;
         offline.Height = 28;
         offline.Margin = new Padding(0);
-        layout.Controls.Add(offline, 0, 6);
+        layout.Controls.Add(offline, 0, 7);
         applyProfile.Text = "Apply chosen profile";
         applyProfile.Dock = DockStyle.Fill;
         applyProfile.BackColor = Color.FromArgb(38, 72, 86);
         applyProfile.ForeColor = Cyan;
         applyProfile.Margin = new Padding(0, 3, 0, 0);
         applyProfile.Click += delegate { LaunchChosenProfile(); };
-        layout.Controls.Add(applyProfile, 0, 7);
+        layout.Controls.Add(applyProfile, 0, 8);
+        preset.SelectedIndexChanged += delegate { RefreshProfileSummary(); browse.Enabled = preset.SelectedIndex != 1; };
+        config.TextChanged += delegate { RefreshProfileSummary(); };
+        RefreshProfileSummary();
         card.Controls.Add(layout);
-        new ToolTip().SetToolTip(config, "Optional local JSON configuration path or http(s) URL. Config and Preset combine using WinUtil's original behavior.");
+        new ToolTip().SetToolTip(config, "Optional local JSON configuration path or http(s) URL. Original WinUtil presets can combine with Config. Gaming applies Game Mode only and disables this field.");
         return card;
+    }
+
+    private static string PresetArgument(int selectedIndex)
+    {
+        string[] presets = { null, "Gaming", "Standard", "Minimal", "Advanced" };
+        return selectedIndex >= 0 && selectedIndex < presets.Length ? presets[selectedIndex] : null;
+    }
+
+    private void RefreshProfileSummary()
+    {
+        bool gaming = PresetArgument(preset.SelectedIndex) == "Gaming";
+        config.Enabled = !gaming;
+        if (gaming)
+            profileSummary.Text = "Enables Windows Game Mode only (WPFToggleGameMode). Your power plan, services, security settings, and apps stay as they are.";
+        else if (preset.SelectedIndex > 1)
+            profileSummary.Text = "Applies WinUtil's original " + PresetArgument(preset.SelectedIndex) + " preset" + (String.IsNullOrWhiteSpace(config.Text) ? "." : " together with your config.") + " Open full WinUtil to review individual choices.";
+        else
+            profileSummary.Text = String.IsNullOrWhiteSpace(config.Text) ? "No automatic changes selected. Gaming enables Game Mode; the other presets use WinUtil's original selections." : "Applies the choices in your config file or URL. Review the config before starting.";
+        applyProfile.Enabled = !operationActive && (preset.SelectedIndex > 0 || !String.IsNullOrWhiteSpace(config.Text));
     }
 
     private RoundedCard BuildExpectations()
@@ -286,8 +367,9 @@ internal sealed class Dashboard : Form
 
     private Panel BuildMonitor()
     {
-        Panel page = new Panel();
+        Panel page = new Panel { AutoScroll = true };
         TableLayoutPanel layout = Table(1, 3);
+        MakeScrollable(page, layout, 570);
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 224));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 177));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -332,8 +414,9 @@ internal sealed class Dashboard : Form
 
     private Panel BuildComparisons()
     {
-        Panel page = new Panel();
+        Panel page = new Panel { AutoScroll = true };
         TableLayoutPanel layout = Table(1, 5);
+        MakeScrollable(page, layout, 540);
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 110));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 49));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
@@ -412,7 +495,7 @@ internal sealed class Dashboard : Form
             try { sample = telemetry.Sample(); } catch (Exception error) { failure = error; }
             Post(delegate {
                 sampling = false;
-                if (failure != null) { status.Text = "Some metrics are unavailable: " + failure.Message; return; }
+                if (failure != null) { sensorStatus.Text = "Sensors: some readings unavailable  ·  " + failure.Message; return; }
                 UpdateTelemetry(sample);
             });
         });
@@ -446,7 +529,7 @@ internal sealed class Dashboard : Form
             foreach (string note in sample.Notes) { if (readingNotes.Length > 330) break; readingNotes.Append(note).Append('\n'); }
         if (readingNotes.Length <= 16) readingNotes.Append("Live data available. — means unavailable.");
         notes.Text = readingNotes.ToString();
-        status.Text = "Live  ·  " + DateTime.Now.ToString("HH:mm:ss") + "  ·  Read-only metrics. Activity is not a benchmark score.";
+        sensorStatus.Text = "Sensors: live at " + DateTime.Now.ToString("HH:mm:ss") + "  ·  CPU/RAM every second; GPU/storage every five seconds  ·  — means unavailable";
         if (capturing)
         {
             captureSamples.Add(sample);
@@ -464,44 +547,85 @@ internal sealed class Dashboard : Form
             MessageBox.Show(this, "Choose a preset or configuration first, or use Open full WinUtil to choose individual options.", "No profile selected", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
-        List<string> arguments = new List<string>();
-        if (!String.IsNullOrWhiteSpace(config.Text)) { arguments.Add("-Config"); arguments.Add(config.Text.Trim()); }
-        if (preset.SelectedIndex != 0) { arguments.Add("-Preset"); arguments.Add(preset.SelectedItem.ToString()); }
-        if (offline.Checked) arguments.Add("-Offline");
-        try { OpenVendor(Launcher.ParseOptions(arguments.ToArray())); }
+        try { OpenVendor(Launcher.ParseOptions(ChosenProfileArguments())); }
         catch (Exception error) { MessageBox.Show(this, error.Message, "Profile could not start", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+    }
+
+    private string[] ChosenProfileArguments()
+    {
+        List<string> arguments = new List<string>();
+        string selectedPreset = PresetArgument(preset.SelectedIndex);
+        // Gaming is an explicit single-tweak companion profile. A disabled, previously
+        // entered config must not silently add changes to it.
+        if (selectedPreset != "Gaming" && !String.IsNullOrWhiteSpace(config.Text)) { arguments.Add("-Config"); arguments.Add(config.Text.Trim()); }
+        if (selectedPreset != null) { arguments.Add("-Preset"); arguments.Add(selectedPreset); }
+        if (offline.Checked) arguments.Add("-Offline");
+        return arguments.ToArray();
     }
 
     private void OpenVendor(Launcher.LaunchOptions options)
     {
-        if (previewMode) return;
+        if (previewMode || operationActive) return;
         fullWinUtil.Enabled = applyProfile.Enabled = false;
-        status.Text = "Requesting UAC to start the original WinUtil. Monitoring continues.";
+        if (logWindow != null && !logWindow.IsDisposed) { logWindow.Close(); logWindow = null; }
+        if (vendorSession != null) { vendorSession.Dispose(); vendorSession = null; }
+        openLog.Enabled = false;
+        SetOperationStatus("Starting", "Waiting for Windows administrator approval. Monitoring continues.", true, 0);
         ThreadPool.QueueUserWorkItem(delegate {
             try
             {
-                using (Process process = Launcher.StartVendor(options))
-                {
-                    Post(delegate { fullWinUtil.Enabled = applyProfile.Enabled = true; status.Text = "WinUtil started. Monitoring continues in this dashboard."; });
-                    process.WaitForExit();
-                    int code = process.ExitCode;
-                    Post(delegate {
-                        status.Text = code == 0 ? "WinUtil finished. Capture After with the same workload when ready." : "WinUtil returned exit code " + code + ".";
-                        if (code != 0) MessageBox.Show(this, "WinUtil's elevated PowerShell process returned exit code " + code + ". Detailed errors are in WinUtil's own logs.", "WinUtil did not complete", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    });
-                }
+                VendorSession session = Launcher.StartVendorSession(options);
+                Post(delegate { vendorSession = session; openLog.Enabled = true; SetOperationStatus("Running", options.Preset == "Gaming" ? "Enabling Windows Game Mode. Show log for details." : "WinUtil is running. Show log for progress and errors.", true, 0); PollVendorSession(); });
             }
             catch (Exception error)
             {
                 Post(delegate {
-                    fullWinUtil.Enabled = applyProfile.Enabled = true;
+                    fullWinUtil.Enabled = true;
+                    VendorSession failedSession = error.Data["WinUtilSession"] as VendorSession;
+                    if (failedSession != null) { vendorSession = failedSession; openLog.Enabled = true; }
                     Win32Exception windowsError = error as Win32Exception;
-                    if (windowsError != null && windowsError.NativeErrorCode == 1223) { status.Text = "UAC canceled. No WinUtil action was started."; return; }
-                    status.Text = "WinUtil could not start.";
+                    if (windowsError != null && windowsError.NativeErrorCode == 1223) { SetOperationStatus("Canceled", "Administrator approval was canceled. No WinUtil action started.", false, 0); RefreshProfileSummary(); return; }
+                    SetOperationStatus("Failed", "WinUtil could not start: " + error.Message, false, 1);
+                    RefreshProfileSummary();
                     MessageBox.Show(this, error.Message, "WinUtil could not start", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 });
             }
         });
+    }
+
+    private void PollVendorSession()
+    {
+        if (vendorSession == null || !operationActive || sessionPolling || IsDisposed) return;
+        VendorSession session = vendorSession;
+        sessionPolling = true;
+        ThreadPool.QueueUserWorkItem(delegate {
+            VendorSessionSnapshot snapshot = null; Exception failure = null;
+            try { snapshot = session.RefreshSnapshot(); } catch (Exception error) { failure = error; }
+            Post(delegate {
+                sessionPolling = false;
+                if (!Object.ReferenceEquals(session, vendorSession)) return;
+                if (failure != null) { SetOperationStatus(operationStage, "Status temporarily unavailable. Show log for details.", operationActive, operationErrors); return; }
+                if (snapshot == null) return;
+                string message = String.IsNullOrWhiteSpace(snapshot.Message) ? "Show log for progress and error details." : snapshot.Message;
+                if (snapshot.ErrorCount > 0 && !String.IsNullOrWhiteSpace(snapshot.LastError)) message += "  ·  " + snapshot.LastError;
+                SetOperationStatus(String.IsNullOrWhiteSpace(snapshot.Stage) ? "Running" : snapshot.Stage, message, !snapshot.Completed, snapshot.ErrorCount);
+                fullWinUtil.Enabled = snapshot.Completed;
+                RefreshProfileSummary();
+            });
+        });
+    }
+
+    private void ShowRunLog()
+    {
+        if (vendorSession == null) return;
+        if (logWindow == null || logWindow.IsDisposed)
+        {
+            VendorSession session = vendorSession;
+            logWindow = new RunLogWindow(session.LogPath, delegate { return session.ReadLogTail(250000); });
+            logWindow.Show(this);
+        }
+        else logWindow.Activate();
+        logWindow.RefreshLog();
     }
 
     private void BeginCapture(bool isBefore)
@@ -514,6 +638,7 @@ internal sealed class Dashboard : Form
         captureBefore.Enabled = captureAfter.Enabled = false;
         captureProgress.Value = 0;
         captureStatus.Text = "Capturing " + (isBefore ? "Before" : "After") + " for ten seconds. Keep your workload unchanged.";
+        SetActivityStatus("Capturing " + (isBefore ? "Before" : "After") + " for ten seconds. Monitoring continues.");
         RequestSample();
     }
 
@@ -525,6 +650,7 @@ internal sealed class Dashboard : Form
         captureBefore.Enabled = captureAfter.Enabled = true;
         captureProgress.Value = 100;
         captureStatus.Text = snapshot.Name + " captured  ·  " + snapshot.SampleCount + " samples over " + snapshot.DurationSeconds.ToString("0.0") + " seconds. Compare the same workload.";
+        SetActivityStatus(snapshot.Name + " capture complete. Compare the same workload.");
         RefreshComparison();
         try
         {
@@ -607,7 +733,7 @@ internal sealed class Dashboard : Form
                     content = data.ToString();
                 }
                 File.WriteAllText(dialog.FileName, content, Encoding.UTF8);
-                status.Text = "Exported comparison to " + dialog.FileName;
+                SetActivityStatus("Exported comparison to " + dialog.FileName);
             }
             catch (Exception error) { MessageBox.Show(this, error.Message, "Export failed", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         }
@@ -651,7 +777,8 @@ internal sealed class Dashboard : Form
     {
         // Render only the initial controls, without personal captures or hardware readings.
         // This is not a screen/desktop capture and does not execute WinUtil.
-        status.Text = "PREVIEW  ·  Initial state; readings begin when you open the dashboard. No WinUtil action executed.";
+        SetOperationStatus("Ready", "Choose a profile or open full WinUtil. No automatic changes selected.", false, 0);
+        sensorStatus.Text = "PREVIEW  ·  Initial state; no personal readings or captures; no WinUtil action executed";
         SelectPage(page);
         StartPosition = FormStartPosition.Manual;
         Location = new Point(-32000, -32000);
@@ -694,8 +821,82 @@ internal sealed class Dashboard : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { if (timer != null) timer.Dispose(); if (telemetry != null) telemetry.Dispose(); }
+        if (disposing) { if (logWindow != null) logWindow.Dispose(); if (timer != null) timer.Dispose(); if (telemetry != null) telemetry.Dispose(); }
         base.Dispose(disposing);
+    }
+
+    internal static Dictionary<string, object> RunUiSelfTests()
+    {
+        Dictionary<string, object> results = new Dictionary<string, object>();
+        using (Dashboard dashboard = new Dashboard(true))
+        {
+            dashboard.config.Text = "https://example.invalid/profile.json";
+            dashboard.preset.SelectedIndex = 1;
+            string[] gaming = dashboard.ChosenProfileArguments();
+            RequireUi(gaming.Length == 2 && gaming[0] == "-Preset" && gaming[1] == "Gaming", "Gaming must launch the single companion profile without a leftover config.");
+            RequireUi(!dashboard.config.Enabled && dashboard.profileSummary.Text.Contains("WPFToggleGameMode"), "Gaming needs an exact scope summary and disabled config.");
+            RequireUi(Launcher.ParseOptions(gaming).Preset == "Gaming", "Gaming must be accepted by the launcher.");
+            results["gamingPresetMapsWithoutExtraConfig"] = true;
+            results["gamingScopeVisible"] = true;
+            dashboard.config.Text = "";
+            string[] vendorPresets = { "Standard", "Minimal", "Advanced" };
+            for (int index = 0; index < vendorPresets.Length; index++)
+            {
+                dashboard.preset.SelectedIndex = index + 2;
+                string[] selected = dashboard.ChosenProfileArguments();
+                RequireUi(selected.Length == 2 && selected[1] == vendorPresets[index], "Vendor preset mapping changed.");
+            }
+            results["originalPresetsPreserved"] = true;
+            dashboard.preset.SelectedIndex = 0;
+            RequireUi(!dashboard.applyProfile.Enabled && !dashboard.openLog.Enabled, "Apply and log controls must be unavailable before a selection or run.");
+            dashboard.ShowRunLog();
+            RequireUi(dashboard.logWindow == null, "Show log without a run must not open a dialog or launch anything.");
+            results["noRunLogIsNonMutating"] = true;
+            dashboard.SetOperationStatus("Running", "Applying a synthetic test profile", true, 2);
+            string operation = dashboard.status.Text;
+            TelemetrySample synthetic = new TelemetrySample { Timestamp = DateTime.UtcNow.ToString("o"), CpuPercent = 15, MemoryUsedGB = 8, MemoryTotalGB = 16, MemoryPercent = 50, Storage = new List<StorageReading>(), Notes = new List<string>() };
+            dashboard.UpdateTelemetry(synthetic);
+            dashboard.SetActivityStatus("A comparison export finished");
+            RequireUi(dashboard.status.Text == operation && dashboard.errorsStatus.Text == "Errors: 2" && dashboard.operationProgress.IsIndeterminate, "Telemetry or export replaced active operation status.");
+            RequireUi(dashboard.sensorStatus.Text.Contains("Sensors: live"), "Sensor status must update separately.");
+            results["operationSurvivesTelemetryAndExport"] = true;
+            results["separateSensorStatusAndErrorCount"] = true;
+            dashboard.SetOperationStatus("Completed", "Synthetic run finished; inspect log", false, 2);
+            operation = dashboard.status.Text;
+            dashboard.UpdateTelemetry(synthetic);
+            RequireUi(dashboard.status.Text == operation && !dashboard.operationProgress.IsIndeterminate, "Completed status must persist after later readings.");
+            results["completionSurvivesTelemetry"] = true;
+            dashboard.Size = dashboard.MinimumSize;
+            ForceHandles(dashboard);
+            dashboard.PerformLayout();
+            Rectangle statusBounds = dashboard.RectangleToClient(dashboard.status.RectangleToScreen(dashboard.status.ClientRectangle));
+            RequireUi(statusBounds.Top >= 0 && statusBounds.Bottom <= dashboard.ClientSize.Height && statusBounds.Width > 250, "Status bar was clipped at the minimum window size.");
+            RequireUi(dashboard.pages[0].AutoScroll && dashboard.pages[1].AutoScroll && dashboard.pages[2].AutoScroll, "Short windows need scroll access to page content.");
+            results["minimumWindowKeepsStatusVisibleAndPagesScrollable"] = true;
+        }
+        string testPath = Path.Combine(Path.GetTempPath(), "winutil-log-ui-test-" + Guid.NewGuid().ToString("N") + ".log");
+        try
+        {
+            const string expected = "SYNTHETIC UI TEST\r\nERROR: Example diagnostic details\r\n";
+            File.WriteAllText(testPath, expected, Encoding.UTF8);
+            using (RunLogWindow window = new RunLogWindow(testPath, delegate { return File.ReadAllText(testPath); }))
+            {
+                window.LoadForTest();
+                RequireUi(window.DisplayedLog == expected && window.DisplayedPath == testPath, "Run log viewer must show the actual selected run's readable log and path.");
+            }
+            results["logViewerReadsActualSyntheticFile"] = true;
+        }
+        finally { if (File.Exists(testPath)) File.Delete(testPath); }
+        results["success"] = true;
+        results["vendorScriptExecuted"] = false;
+        results["elevationRequested"] = false;
+        results["personalDataRead"] = false;
+        return results;
+    }
+
+    private static void RequireUi(bool condition, string message)
+    {
+        if (!condition) throw new InvalidOperationException("Dashboard UI check failed: " + message);
     }
 
     private static TableLayoutPanel Table(int columns, int rows)
@@ -703,6 +904,15 @@ internal sealed class Dashboard : Form
         TableLayoutPanel layout = new TableLayoutPanel { ColumnCount = columns, RowCount = rows, Dock = DockStyle.Fill, Margin = new Padding(0), Padding = new Padding(0), BackColor = Color.Transparent };
         if (columns == 1) layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         return layout;
+    }
+    private static void MakeScrollable(Panel page, TableLayoutPanel layout, int minimumHeight)
+    {
+        // A Dock.Fill child is excluded from WinForms' automatic scroll extent.
+        // Dock.Top plus a minimum content height keeps every action reachable.
+        layout.Dock = DockStyle.Top;
+        layout.Height = minimumHeight;
+        page.AutoScrollMinSize = new Size(0, minimumHeight);
+        page.Resize += delegate { layout.Height = Math.Max(minimumHeight, page.ClientSize.Height); };
     }
     private static Label LabelText(string text, float size, Color color, FontStyle style = FontStyle.Regular)
     {
@@ -777,13 +987,90 @@ internal sealed class ThinProgress : Control
 {
     public int Minimum = 0, Maximum = 100;
     private int value;
+    private int animationStep;
+    internal bool IsIndeterminate;
     public int Value { get { return value; } set { this.value = Math.Min(Maximum, Math.Max(Minimum, value)); Invalidate(); } }
     internal ThinProgress() { DoubleBuffered = true; }
+    internal void AdvanceAnimation() { if (IsIndeterminate) { animationStep = (animationStep + 1) % 12; Invalidate(); } }
     protected override void OnPaint(PaintEventArgs e)
     {
         e.Graphics.Clear(Color.FromArgb(28, 45, 64));
+        if (IsIndeterminate)
+        {
+            int segmentWidth = Math.Max(30, Width / 5);
+            int left = (Width + segmentWidth) * animationStep / 11 - segmentWidth;
+            using (Brush accent = new SolidBrush(Dashboard.Cyan)) e.Graphics.FillRectangle(accent, left, 0, segmentWidth, Height);
+            return;
+        }
         if (value > Minimum)
             using (Brush accent = new SolidBrush(Dashboard.Cyan)) e.Graphics.FillRectangle(accent, 0, 0, Width * (value - Minimum) / Math.Max(1, Maximum - Minimum), Height);
+    }
+}
+
+internal sealed class RunLogWindow : Form
+{
+    private readonly Func<string> readLog;
+    private readonly TextBox log = new TextBox();
+    private readonly Label path = new Label();
+    private readonly Label readingStatus = new Label();
+    private bool reading;
+    internal string DisplayedLog { get { return log.Text; } }
+    internal string DisplayedPath { get { return path.Text; } }
+
+    internal RunLogWindow(string logPath, Func<string> reader)
+    {
+        readLog = reader;
+        Text = "WinUtil run log"; BackColor = Dashboard.Background; ForeColor = Dashboard.Foreground;
+        Font = new Font("Segoe UI", 10); ClientSize = new Size(820, 500); MinimumSize = new Size(570, 350);
+        StartPosition = FormStartPosition.CenterParent;
+        TableLayoutPanel layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(18), ColumnCount = 1, RowCount = 4, BackColor = Dashboard.Background };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 33)); layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        layout.Controls.Add(new Label { Text = "Run output & error details", Dock = DockStyle.Fill, ForeColor = Dashboard.Foreground, Font = new Font("Segoe UI", 16, FontStyle.Bold), AutoSize = false }, 0, 0);
+        path.Text = logPath; path.Dock = DockStyle.Fill; path.ForeColor = Dashboard.Muted; path.Font = new Font("Segoe UI", 8.5F); path.AutoEllipsis = true; path.UseMnemonic = false;
+        layout.Controls.Add(path, 0, 1);
+        log.Dock = DockStyle.Fill; log.Multiline = true; log.ReadOnly = true; log.WordWrap = false; log.ScrollBars = ScrollBars.Both;
+        log.BackColor = Dashboard.Sidebar; log.ForeColor = Dashboard.Foreground; log.BorderStyle = BorderStyle.FixedSingle;
+        log.Font = new Font("Consolas", 9.5F); log.Text = "Waiting for run output…";
+        layout.Controls.Add(log, 0, 2);
+        readingStatus.Text = "Updates while the run is active. This window shows the latest log tail.";
+        readingStatus.ForeColor = Dashboard.Muted; readingStatus.Dock = DockStyle.Fill; readingStatus.Font = new Font("Segoe UI", 8.5F); readingStatus.TextAlign = ContentAlignment.MiddleLeft;
+        layout.Controls.Add(readingStatus, 0, 3); Controls.Add(layout);
+        Shown += delegate { RefreshLog(); };
+    }
+
+    internal void RefreshLog()
+    {
+        if (reading || IsDisposed || !IsHandleCreated) return;
+        reading = true;
+        ThreadPool.QueueUserWorkItem(delegate {
+            string text = null; Exception failure = null;
+            try { text = readLog(); } catch (Exception error) { failure = error; }
+            if (IsDisposed || !IsHandleCreated) return;
+            try { BeginInvoke(new Action(delegate {
+                reading = false;
+                if (failure != null) { readingStatus.Text = "Log temporarily unavailable: " + failure.Message; return; }
+                SetLog(text);
+            })); } catch (InvalidOperationException) { }
+        });
+    }
+
+    internal void LoadForTest() { SetLog(readLog()); }
+
+    private void SetLog(string text)
+    {
+        string readable = String.IsNullOrWhiteSpace(text) ? "Waiting for run output…" : text;
+        if (log.Text != readable)
+        {
+            bool followTail = log.SelectionStart >= Math.Max(0, log.TextLength - 2);
+            int selection = log.SelectionStart;
+            log.Text = readable;
+            log.SelectionStart = followTail ? log.TextLength : Math.Min(selection, log.TextLength);
+            log.SelectionLength = 0;
+            if (followTail) log.ScrollToCaret();
+        }
+        readingStatus.Text = "Updated " + DateTime.Now.ToString("HH:mm:ss") + "  ·  Latest run output and persisted error details";
     }
 }
 

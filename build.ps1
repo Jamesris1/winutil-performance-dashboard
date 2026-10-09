@@ -16,6 +16,14 @@ if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
 
 $outputDirectory = Join-Path $PSScriptRoot 'dist'
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+$sessionWrapper = Join-Path $PSScriptRoot 'src\Run-WinUtilSession.ps1'
+$extension = Join-Path $PSScriptRoot 'src\WinUtilExtension.ps1'
+$helperHashes = [ordered]@{
+    'WinUtil.SessionWrapper' = (Get-FileHash -LiteralPath $sessionWrapper -Algorithm SHA256).Hash
+    'WinUtil.Extension' = (Get-FileHash -LiteralPath $extension -Algorithm SHA256).Hash
+}
+$helperManifest = Join-Path $outputDirectory 'helper-hashes.json'
+[IO.File]::WriteAllText($helperManifest, ($helperHashes | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
 $arguments = @(
     '/nologo', '/noconfig', '/target:winexe', '/platform:anycpu', '/optimize+', '/debug-',
     ('/out:' + (Join-Path $outputDirectory 'WinUtil-Performance.exe')),
@@ -25,11 +33,15 @@ $arguments = @(
     ('/resource:' + (Join-Path $PSScriptRoot 'vendor\WINUTIL-LICENSE.txt') + ',WinUtil.License'),
     ('/resource:' + (Join-Path $PSScriptRoot 'LICENSE') + ',WinUtil.DashboardLicense'),
     ('/resource:' + (Join-Path $PSScriptRoot 'assets\dashboard.ico') + ',WinUtil.Icon'),
+    ('/resource:' + $sessionWrapper + ',WinUtil.SessionWrapper'),
+    ('/resource:' + $extension + ',WinUtil.Extension'),
+    ('/resource:' + $helperManifest + ',WinUtil.HelperHashes'),
     '/reference:System.dll', '/reference:System.Core.dll', '/reference:System.Windows.Forms.dll',
     '/reference:System.Drawing.dll', '/reference:System.Web.Extensions.dll',
     (Join-Path $PSScriptRoot 'src\launcher.cs'),
     (Join-Path $PSScriptRoot 'src\Dashboard.cs'),
     (Join-Path $PSScriptRoot 'src\PerformanceTelemetry.cs')
+    (Join-Path $PSScriptRoot 'src\VendorSession.cs')
 )
 & $compiler @arguments
 if ($LASTEXITCODE -ne 0) { throw ('C# compiler failed with exit code ' + $LASTEXITCODE) }

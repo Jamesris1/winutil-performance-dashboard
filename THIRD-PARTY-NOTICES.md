@@ -11,7 +11,7 @@ This project is an independent companion dashboard. It is not affiliated with or
 - Included source: `vendor/winutil.ps1`, embedded without modification in the application.
 - SHA-256: `EEAE69922FBE6354EA4E2A37F705EAA17BDAF45CC7889618A313178A513B13EE`
 
-WinUtil provides the original system tools, presets, and software-installation features. The dashboard, monitoring, comparison, and export interface are this project's additions.
+WinUtil provides the original system tools, presets, and software-installation features. The dashboard, monitoring, comparison, export interface, and runtime session-log panel are this project's additions. The companion wrapper adds its log panel during startup while preserving the exact bundled upstream file.
 
 The build verifies the pinned script hash before compiling. The application verifies it again before running WinUtil and includes the original MIT license as an embedded resource. The license can also be inspected with `--license`.
 

@@ -15,8 +15,8 @@ using System.Web.Script.Serialization;
 [assembly: AssemblyDescription("Independent companion dashboard and launcher for the unmodified Chris Titus Tech WinUtil 26.10.07 release.")]
 [assembly: AssemblyCompany("WinUtil Performance contributors")]
 [assembly: AssemblyProduct("WinUtil Performance Dashboard")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 internal static class Launcher
 {
@@ -60,7 +60,8 @@ internal static class Launcher
 
             if (options.SelfTest)
             {
-                Console.WriteLine("{\"success\":true,\"companionVersion\":\"1.0.0\",\"version\":" + JsonString(Version) +
+                Dictionary<string, string> helperHashes = VerifyCompanionResources();
+                Console.WriteLine("{\"success\":true,\"companionVersion\":\"1.1.0\",\"version\":" + JsonString(Version) +
                     ",\"embeddedResource\":" + JsonString(ResourceName) +
                     ",\"embeddedBytes\":" + script.Length +
                     ",\"sha256\":" + JsonString(Hash(script)) +
@@ -69,14 +70,30 @@ internal static class Launcher
                     ",\"windowsPowerShellPresent\":" + (File.Exists(powershell) ? "true" : "false") +
                     ",\"dotNetRuntime\":" + JsonString(Environment.Version.ToString()) +
                     ",\"capabilities\":{\"defaultPerformanceDashboard\":true,\"completeVendorGuiButton\":true,\"configFileOrHttpUrl\":true," +
-                    "\"presets\":[\"Standard\",\"Minimal\",\"Advanced\"],\"offlineFlag\":true," +
+                    "\"presets\":[\"Gaming\",\"Standard\",\"Minimal\",\"Advanced\"],\"offlineFlag\":true," +
                     "\"configAndPresetCanCombine\":true,\"usesUnmodifiedOfficialScript\":true," +
-                    "\"readOnlyLiveTelemetry\":true,\"tenSecondBeforeAfterCapture\":true,\"jsonAndCsvExport\":true}" +
+                    "\"readOnlyLiveTelemetry\":true,\"tenSecondBeforeAfterCapture\":true,\"jsonAndCsvExport\":true," +
+                    "\"fullGuiErrorPanel\":true,\"persistentSessionLogs\":true,\"dashboardOperationStatus\":true,\"gamingSelection\":\"WPFToggleGameMode\"}" +
+                    ",\"companionResourcesVerified\":" + helperHashes.Count +
                     ",\"requestedMode\":" + JsonString(options.Automation ? "vendorHeadlessAutomation" : (options.Offline ? "fullVendorGui" : "performanceDashboard")) +
                     ",\"vendorArguments\":" + JsonArray(VendorArguments(options)) +
                     ",\"commandLinePreview\":" + JsonString(BuildPowerShellArguments("<embedded-winutil.ps1>", options)) +
                     ",\"vendorScriptExecuted\":false" +
                     ",\"guiLaunched\":false,\"elevationRequested\":false,\"cacheWritten\":false}");
+                return 0;
+            }
+
+            if (options.UiSelfTest)
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Console.WriteLine(new JavaScriptSerializer().Serialize(Dashboard.RunUiSelfTests()));
+                return 0;
+            }
+
+            if (options.BridgeSelfTest)
+            {
+                Console.WriteLine(new JavaScriptSerializer().Serialize(RunBridgeSelfTests()));
                 return 0;
             }
 
@@ -116,12 +133,12 @@ internal static class Launcher
             if (!File.Exists(powershell))
                 throw new FileNotFoundException("Windows PowerShell is required to run this version of WinUtil.", powershell);
 
-            using (Process process = StartVendor(options))
+            using (VendorSession session = StartVendorSession(options))
             {
-                process.WaitForExit();
-                if (process.ExitCode != 0)
-                    throw new InvalidOperationException("WinUtil's PowerShell process exited with code " + process.ExitCode +
-                        ". The launcher cannot capture detailed PowerShell errors from an elevated process.");
+                session.Process.WaitForExit();
+                VendorSessionSnapshot report = session.RefreshSnapshot();
+                if (report.Stage == "Failed" || (report.ExitCode.HasValue && report.ExitCode.Value != 0))
+                    throw new InvalidOperationException(report.Message + "\r\n\r\n" + report.LastError + "\r\nSession log: " + session.LogPath);
             }
             return 0;
         }
@@ -136,22 +153,51 @@ internal static class Launcher
         }
     }
 
-    internal static Process StartVendor(LaunchOptions options)
+    internal static VendorSession StartVendorSession(LaunchOptions options)
     {
             string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
                 @"System32\WindowsPowerShell\v1.0\powershell.exe");
             if (!File.Exists(powershell)) throw new FileNotFoundException("Windows PowerShell 5.1 is required.", powershell);
             string scriptPath = CacheVerifiedScript(ReadVerifiedScript());
+            Dictionary<string, string> hashes = VerifyCompanionResources();
+            string cache = Path.GetDirectoryName(scriptPath);
+            string wrapper = CacheCompanionResource(cache, "WinUtil.SessionWrapper", "session-wrapper", hashes);
+            string extension = CacheCompanionResource(cache, "WinUtil.Extension", "extension", hashes);
+            string sessionsRoot = Path.Combine(cache, "sessions");
+            EnsureNormalDirectory(sessionsRoot);
+            string sessionPath = Path.Combine(sessionsRoot, DateTime.UtcNow.ToString("yyyyMMddTHHmmss") + "-" + Guid.NewGuid().ToString("N"));
+            EnsureNormalDirectory(sessionPath);
+            VendorSession session = new VendorSession(sessionPath);
+            File.WriteAllText(session.LogPath, String.Empty, new UTF8Encoding(false));
+            File.WriteAllText(session.ErrorsPath, String.Empty, new UTF8Encoding(false));
+            session.WriteReport("Starting", "Requesting Windows administrator approval.", 0, String.Empty, null);
+            LaunchOptions resolved = ResolveGaming(options, cache);
             ProcessStartInfo start = new ProcessStartInfo();
             start.FileName = powershell;
-            start.Arguments = BuildPowerShellArguments(scriptPath, options);
+            List<string> launchArguments = new List<string>(new string[] {
+                "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", wrapper,
+                "-ScriptPath", scriptPath, "-ScriptHash", ExpectedHash,
+                "-ExtensionPath", extension, "-ExtensionHash", hashes["WinUtil.Extension"], "-SessionPath", sessionPath
+            });
+            launchArguments.AddRange(VendorArguments(resolved));
+            start.Arguments = JoinArguments(launchArguments);
             start.WorkingDirectory = Path.GetDirectoryName(scriptPath);
             start.UseShellExecute = true;
             start.Verb = "runas";
             start.WindowStyle = ProcessWindowStyle.Hidden;
-            Process process = Process.Start(start);
-            if (process == null) throw new InvalidOperationException("Windows did not start WinUtil.");
-            return process;
+            try
+            {
+                session.Process = Process.Start(start);
+                if (session.Process == null) throw new InvalidOperationException("Windows did not start WinUtil.");
+                return session;
+            }
+            catch (Exception error)
+            {
+                Win32Exception native = error as Win32Exception;
+                session.WriteStartupFailure(error, native != null && native.NativeErrorCode == 1223);
+                error.Data["WinUtilSession"] = session;
+                throw;
+            }
     }
 
     private const string HelpText =
@@ -160,10 +206,11 @@ internal static class Launcher
         "  Opens the performance dashboard. Open full WinUtil launches the complete original interface. No tweaks are applied automatically.\r\n\r\n" +
         "Optional original WinUtil parameters:\r\n" +
         "  -Config, --config <local JSON file or http(s) URL>\r\n" +
-        "  -Preset, --preset <Standard|Minimal|Advanced>\r\n" +
+        "  -Preset, --preset <Gaming|Standard|Minimal|Advanced>\r\n" +
         "  -Offline, --offline\r\n\r\n" +
         "Config or Preset runs the original vendor's headless automation and can apply changes without a GUI.\r\n" +
         "Config and Preset can be combined: the preset supplies a baseline and the config adds selections.\r\n" +
+        "Gaming is a companion preset containing only Windows Game Mode (WPFToggleGameMode), and cannot combine with Config.\r\n" +
         "Offline is the vendor's mode flag; it is not a network sandbox or a guarantee that every operation works offline.\r\n\r\n" +
         "Inspection without launching WinUtil, requesting UAC, or writing the script cache:\r\n" +
         "  --self-test [optional WinUtil parameters]   Validate resource, arguments, and runtime; print JSON.\r\n" +
@@ -173,6 +220,8 @@ internal static class Launcher
         "  --render-preview <PNG path>                Render only this dashboard to an image.\r\n\r\n" +
         "  --preview-page <overview|live|compare>     Optional page for --render-preview.\r\n" +
         "  --license                                 Print the companion and upstream MIT license notices.\r\n\r\n" +
+        "  --ui-self-test                            Validate dashboard state without showing windows or applying actions.\r\n" +
+        "  --bridge-self-test                        Validate session status/error persistence using temporary synthetic data.\r\n\r\n" +
         "This unsigned community companion embeds the unmodified official script and requires Windows PowerShell 5.1 and .NET Framework 4.x.\r\n" +
         "Actual GUI or automation launch requests Windows UAC. Only explicitly supplied WinUtil parameters are forwarded.";
 
@@ -187,6 +236,8 @@ internal static class Launcher
         public string RenderPath;
         public int PreviewPage;
         public bool License;
+        public bool UiSelfTest;
+        public bool BridgeSelfTest;
         public bool Automation { get { return Config != null || Preset != null; } }
     }
 
@@ -198,6 +249,8 @@ internal static class Launcher
                 String.Equals(argument, "--help", StringComparison.OrdinalIgnoreCase) ||
                 String.Equals(argument, "--telemetry-test", StringComparison.OrdinalIgnoreCase) ||
                 String.Equals(argument, "--license", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(argument, "--ui-self-test", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(argument, "--bridge-self-test", StringComparison.OrdinalIgnoreCase) ||
                 String.Equals(argument, "--render-preview", StringComparison.OrdinalIgnoreCase)) return true;
         return false;
     }
@@ -218,9 +271,9 @@ internal static class Launcher
                 case "--preset":
                     if (options.Preset != null) throw new ArgumentException("Preset may only be supplied once.");
                     string preset = NextValue(args, ref index, "Preset");
-                    foreach (string allowed in new string[] { "Standard", "Minimal", "Advanced" })
+                    foreach (string allowed in new string[] { "Gaming", "Standard", "Minimal", "Advanced" })
                         if (String.Equals(preset, allowed, StringComparison.OrdinalIgnoreCase)) options.Preset = allowed;
-                    if (options.Preset == null) throw new ArgumentException("Preset must be Standard, Minimal, or Advanced.");
+                    if (options.Preset == null) throw new ArgumentException("Preset must be Gaming, Standard, Minimal, or Advanced.");
                     break;
                 case "-offline":
                 case "--offline":
@@ -249,10 +302,18 @@ internal static class Launcher
                 case "--license":
                     options.License = true;
                     break;
+                case "--ui-self-test":
+                    options.UiSelfTest = true;
+                    break;
+                case "--bridge-self-test":
+                    options.BridgeSelfTest = true;
+                    break;
                 default:
                     throw new ArgumentException("Unknown argument: " + args[index] + ". Use --help for supported options.");
             }
         }
+        if (options.Preset == "Gaming" && options.Config != null)
+            throw new ArgumentException("Gaming applies only Windows Game Mode. Use Gaming without Config, or choose a vendor preset to combine with Config.");
         return options;
     }
 
@@ -283,7 +344,8 @@ internal static class Launcher
     {
         List<string> arguments = new List<string>();
         if (options.Config != null) { arguments.Add("-Config"); arguments.Add(options.Config); }
-        if (options.Preset != null) { arguments.Add("-Preset"); arguments.Add(options.Preset); }
+        if (options.Preset == "Gaming") { arguments.Add("-Config"); arguments.Add("<companion-game-mode-only.json>"); }
+        else if (options.Preset != null) { arguments.Add("-Preset"); arguments.Add(options.Preset); }
         if (options.Offline) arguments.Add("-Offline");
         return arguments;
     }
@@ -294,6 +356,11 @@ internal static class Launcher
             "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", scriptPath
         });
         arguments.AddRange(VendorArguments(options));
+        return JoinArguments(arguments);
+    }
+
+    private static string JoinArguments(List<string> arguments)
+    {
         StringBuilder commandLine = new StringBuilder();
         foreach (string argument in arguments)
         {
@@ -368,7 +435,7 @@ internal static class Launcher
             throw new IOException("The WinUtil cache path is outside local application data.");
         if (Directory.Exists(cache) && (File.GetAttributes(cache) & FileAttributes.ReparsePoint) != 0)
             throw new IOException("The WinUtil cache directory is a redirected directory. Choose a normal local application-data directory.");
-        Directory.CreateDirectory(cache);
+        EnsureNormalDirectory(cache);
         string destination = Path.Combine(cache, "winutil.ps1");
         if (File.Exists(destination))
         {
@@ -401,6 +468,118 @@ internal static class Launcher
     {
         using (SHA256 sha = SHA256.Create())
             return BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", String.Empty);
+    }
+
+    private static byte[] ReadResource(string name)
+    {
+        using (Stream source = Assembly.GetExecutingAssembly().GetManifestResourceStream(name))
+        {
+            if (source == null) throw new InvalidDataException("Embedded companion resource is missing: " + name);
+            using (MemoryStream buffer = new MemoryStream()) { source.CopyTo(buffer); return buffer.ToArray(); }
+        }
+    }
+
+    private static Dictionary<string, string> VerifyCompanionResources()
+    {
+        string json = Encoding.UTF8.GetString(ReadResource("WinUtil.HelperHashes")).TrimStart('\uFEFF');
+        Dictionary<string, string> hashes = new JavaScriptSerializer().Deserialize<Dictionary<string, string>>(json);
+        foreach (string name in new string[] { "WinUtil.SessionWrapper", "WinUtil.Extension" })
+        {
+            string expected;
+            if (!hashes.TryGetValue(name, out expected) || Hash(ReadResource(name)) != expected)
+                throw new InvalidDataException("Embedded companion resource failed its integrity check: " + name);
+        }
+        return hashes;
+    }
+
+    private static void EnsureNormalDirectory(string path)
+    {
+        string full = Path.GetFullPath(path);
+        DirectoryInfo current = new DirectoryInfo(full);
+        while (current != null)
+        {
+            if (current.Exists && (current.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Redirected companion directories are not supported: " + current.FullName);
+            current = current.Parent;
+        }
+        Directory.CreateDirectory(full);
+        if ((File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("The companion directory changed while it was being prepared.");
+    }
+
+    private static string CacheCompanionResource(string cache, string resource, string baseName, Dictionary<string, string> hashes)
+    {
+        byte[] bytes = ReadResource(resource);
+        string expected = hashes[resource];
+        return CacheVerifiedBytes(cache, baseName + "-" + expected.Substring(0, 16).ToLowerInvariant() + ".ps1", bytes, expected);
+    }
+
+    private static string CacheVerifiedBytes(string cache, string name, byte[] bytes, string expected)
+    {
+        string destination = Path.Combine(cache, name);
+        if (File.Exists(destination))
+        {
+            if ((File.GetAttributes(destination) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("The companion cache file is redirected: " + destination);
+            if (Hash(File.ReadAllBytes(destination)) == expected) return destination;
+        }
+        string temporary = Path.Combine(cache, ".companion-" + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            using (FileStream output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            { output.Write(bytes, 0, bytes.Length); output.Flush(true); }
+            if (File.Exists(destination)) File.Replace(temporary, destination, null);
+            else File.Move(temporary, destination);
+            if (Hash(File.ReadAllBytes(destination)) != expected) throw new InvalidDataException("Companion cache integrity check failed.");
+            return destination;
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+
+    private static LaunchOptions ResolveGaming(LaunchOptions options, string cache)
+    {
+        if (options.Preset != "Gaming") return options;
+        if (options.Config != null) throw new ArgumentException("Gaming cannot combine with Config.");
+        byte[] config = Encoding.UTF8.GetBytes("[\"WPFToggleGameMode\"]\r\n");
+        string expected = Hash(config);
+        string path = CacheVerifiedBytes(cache, "game-mode-only-" + expected.Substring(0, 16).ToLowerInvariant() + ".json", config, expected);
+        return new LaunchOptions { Config = path, Offline = options.Offline };
+    }
+
+    private static object RunBridgeSelfTests()
+    {
+        string temporaryRoot = Path.GetFullPath(Path.GetTempPath());
+        string folder = Path.Combine(temporaryRoot, "WinUtil-bridge-test-" + Guid.NewGuid().ToString("N"));
+        EnsureNormalDirectory(folder);
+        try
+        {
+            using (VendorSession session = new VendorSession(folder))
+            {
+                File.WriteAllText(session.LogPath, "Synthetic transcript\r\n[ERROR] Package installation failed\r\nDetailed error: access denied\r\n", new UTF8Encoding(false));
+                File.WriteAllText(session.ErrorsPath, "Synthetic exception details: access denied\r\nline 42\r\n", new UTF8Encoding(false));
+                session.WriteReport("Running", "Synthetic operation in progress", 1, "access denied", null);
+                VendorSessionSnapshot running = session.RefreshSnapshot();
+                if (running.Stage != "Running" || running.ErrorCount != 1 || running.Completed) throw new InvalidDataException("Running bridge status was lost.");
+                string tail = session.ReadLogTail(8192);
+                if (!tail.Contains("Package installation failed") || !tail.Contains("line 42")) throw new InvalidDataException("Persistent error details were lost.");
+                File.WriteAllText(session.StatusPath, "{incomplete", new UTF8Encoding(false));
+                if (session.RefreshSnapshot().Stage != "Running") throw new InvalidDataException("An incomplete status report replaced the last valid status.");
+                session.WriteReport("Failed", "Synthetic bootstrap failure", 2, "Missing extension", 1);
+                VendorSessionSnapshot failed = session.RefreshSnapshot();
+                if (!failed.Completed || failed.ExitCode != 1 || failed.ErrorCount != 2) throw new InvalidDataException("Bootstrap failure did not reach the dashboard.");
+                session.WriteStartupFailure(new InvalidOperationException("Synthetic process start failure"), false);
+                if (!session.RefreshSnapshot().Completed || !session.ReadLogTail(8192).Contains("Synthetic process start failure")) throw new InvalidDataException("Process startup failure was not persisted.");
+            }
+            return new { success = true, syntheticErrors = true, runningStatusRetained = true, logDetailsReadable = true,
+                incompleteReportRetainsPriorState = true, startupFailurePersisted = true, vendorScriptExecuted = false,
+                elevationRequested = false, cacheWritten = false };
+        }
+        finally
+        {
+            // Only the fresh test directory under the system temp root is removed.
+            if (String.Equals(Path.GetDirectoryName(folder), temporaryRoot.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
+                Directory.Delete(folder, true);
+        }
     }
 
     private static string JsonString(string value)
