@@ -1,0 +1,17 @@
+# Compiled binaries are published as release assets.
+/dist/
+/test-results/
+*.tmp
+*.pdb
+
+# Local measurements can contain machine details and workload notes.
+telemetry-test.json
+performance-before.json
+performance-after.json
+performance-comparison.json
+
+# Editor and OS files.
+.vs/
+.vscode/
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,7 @@
+* text=auto
+
+# Preserve the exact pinned upstream release bytes on every checkout.
+vendor/winutil.ps1 -text
+
+*.png binary
+*.ico binary
